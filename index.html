@@ -8,6 +8,15 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
+<!-- Firebase (compat build -- global `firebase` object, loads/executes
+     synchronously like the libraries above; the app script below runs
+     firebase.initializeApp() immediately, before loadData()/startPolling()
+     fire at the bottom of the file, so no async/module timing issues).
+     Served from cdnjs (same domain as xlsx/jsPDF/Chart.js above) instead of
+     gstatic.com, which some corporate networks block -- a blocked/hanging
+     <script> tag here would freeze the entire page since it's render-blocking. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/firebase/10.12.1/firebase-app-compat.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/firebase/10.12.1/firebase-firestore-compat.min.js"></script>
 <style>
   :root{
     --bg:#D5D8DC;
@@ -247,6 +256,23 @@ const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxmZl0lq8lXRJgN
    accidental sign-off by the wrong person, it does not stop a determined
    technical user. */
 const SIGN_PASSWORD = "kimjs2026";
+
+/* ---------- Firebase (Firestore thay cho Google Sheet "Data") ----------
+   APPS_SCRIPT_URL phía trên vẫn giữ lại, CHỈ dùng cho action 'exportPdf'
+   (Bước 8 của lộ trình migrate) -- toàn bộ đọc/ghi dữ liệu OT hàng ngày
+   (Staff/Worker/DailySummary) sẽ đi qua Firestore collection 'ot_data'
+   thay vì gọi Apps Script + Sheet như trước. */
+const firebaseConfig = {
+  apiKey: "AIzaSyB1MlAQoO34LJiSaskm1lJu8SSQYAKCuEo",
+  authDomain: "qa-overtime-f.firebaseapp.com",
+  projectId: "qa-overtime-f",
+  storageBucket: "qa-overtime-f.firebasestorage.app",
+  messagingSenderId: "780769360817",
+  appId: "1:780769360817:web:5b4ae73e040c738e685b90"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+const OT_COLLECTION = 'ot_data';
 /* ===================== */
 
 const SIG_IMG = "data:image/png;base64,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";
@@ -522,31 +548,47 @@ function withPayloadFallback_(url, bodyObj){
   return url + (url.indexOf('?') === -1 ? '?' : '&') + q;
 }
 
+/* ---------- Firestore data-access layer (thay cho fetch() toi Apps Script)
+   ----------
+   4 ham nay giu NGUYEN chu ky goi (tham so, gia tri tra ve) nhu truoc -
+   moi noi khac trong file (loadData, applyDelta, fetchAllTrendDates...)
+   KHONG can sua gi ca.
+
+   Tham so `signal` cua apiGet duoc GIU LAI trong chu ky ham de khong phai
+   sua noi goi, nhung KHONG con duoc dung: Firestore SDK khong nhan
+   AbortSignal kieu fetch. Dieu nay AN TOAN vi loadData() da co san co che
+   doi chieu "requestedKey === storageDateKey()" SAU khi await xong (xem
+   loadData() ben duoi) de bo qua ket qua tra ve tre/thua - do moi la thu
+   dam bao dung, khong phai viec huy request som. Mat di la mot chut toi uu
+   phu (giai phong ket noi ngay lap tuc khi doi tab/ngay lien tuc), khong
+   anh huong tinh dung dan. */
 async function apiGet(date, signal){
-  const url = APPS_SCRIPT_URL + '?date=' + encodeURIComponent(date) + '&_=' + Date.now();
-  const res = await fetchWithRetry(url, { method: 'GET', signal });
-  return await res.json();
+  const snap = await db.collection(OT_COLLECTION).doc(date).get();
+  return snap.exists ? snap.data() : {};
 }
 
 async function apiSave(date, data){
-  const body = { date, data };
-  const res = await fetchWithRetry(withPayloadFallback_(APPS_SCRIPT_URL, body), {
-    method: 'POST',
-    body: JSON.stringify(body)
+  const payload = Object.assign({}, data, {
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
   });
-  return await res.json();
+  await db.collection(OT_COLLECTION).doc(date).set(payload);
+  return Object.assign({ success: true }, data);
 }
 
-/* Lay nhieu key trong 1 lan goi POST (dung cho tab Trend thay vi goi
-   apiGet() rieng cho tung ngay). Tra ve map { key: {rows:[...]} }. */
+/* Lay nhieu key trong 1 lan (dung cho tab Trend thay vi goi apiGet() rieng
+   cho tung ngay). Tra ve map { key: {rows:[...]} }.
+   Khac voi Apps Script/Sheet ban dau (phai quet ca cot Key roi moi doc
+   dung dong can), Firestore doc theo dung Document ID nen chi can
+   Promise.all(getDoc) song song cho tung key - don gian va nhanh hon han
+   thu thuat getRangeList() cu trong Calc.gs. */
 async function apiGetBulk(keys){
   if(!keys.length) return {};
-  const body = { action: 'getBulk', keys };
-  const res = await fetchWithRetry(withPayloadFallback_(APPS_SCRIPT_URL, body), {
-    method: 'POST',
-    body: JSON.stringify(body)
-  });
-  return await res.json();
+  const out = {};
+  await Promise.all(keys.map(async (k) => {
+    const snap = await db.collection(OT_COLLECTION).doc(k).get();
+    if(snap.exists) out[k] = snap.data();
+  }));
+  return out;
 }
 
 /* Bam nut Refresh (thu cong): nut mo di (disabled) trong it nhat 3 giay du
@@ -1146,13 +1188,70 @@ function sumOrNull(arr){
   return vals.reduce((a, b) => a + b, 0);
 }
 
+/* Thay cho handleRequestBody_ ben code.gs (doc-sua-ghi trong 1 request,
+   bao ve boi LockService). Firestore transaction lam dung viec tuong tu:
+   doc lai document NGAY BEN TRONG transaction, ap dung switch(action), roi
+   ghi lai - neu co request khac ghi de document nay giua chung, Firestore
+   TU DONG phat hien xung dot va chay lai callback nay (retry), dam bao
+   khong bao gio 2 addRow cung luc lam mat du lieu cua nhau (tuong duong
+   LockService.waitLock nhung khong can tu quan ly lock/timeout). */
 async function apiDelta(date, action, payload){
-  const body = { date, action, payload };
-  const res = await fetchWithRetry(withPayloadFallback_(APPS_SCRIPT_URL, body), {
-    method: 'POST',
-    body: JSON.stringify(body)
-  });
-  return await res.json();
+  const docRef = db.collection(OT_COLLECTION).doc(date);
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(docRef);
+      let data = snap.exists ? snap.data() : null;
+      if(!data || !Array.isArray(data.rows)){
+        data = { rows: [], approved: false, approvedAt: null, approvedBy: null, rejected: false, rejectedAt: null, rejectedBy: null, rejectComment: '' };
+      }
+      switch(action){
+        case 'addRow':
+          // Chot an toan phia client (tuong duong ben code.gs): bo qua neu
+          // trung id (retry/bam 2 lan) thay vi them dong trung lap.
+          if(!data.rows.some(r => r.id === payload.row.id)){
+            data.rows = data.rows.concat([payload.row]);
+          }
+          break;
+        case 'deleteRow':
+          data.rows = data.rows.filter(r => r.id !== payload.id);
+          break;
+        case 'sign':
+          data.approved = true;
+          data.approvedAt = new Date().toISOString();
+          data.approvedBy = payload.approvedBy || 'Kim Joo Shik';
+          break;
+        case 'unlock':
+          data.approved = false;
+          data.approvedAt = null;
+          data.rejected = false;
+          data.rejectedAt = null;
+          data.rejectedBy = null;
+          data.rejectComment = '';
+          break;
+        case 'reject':
+          data.approved = false;
+          data.approvedAt = null;
+          data.rejected = true;
+          data.rejectedAt = new Date().toISOString();
+          data.rejectedBy = payload.rejectedBy || 'Kim Joo Shik';
+          data.rejectComment = payload.rejectComment || '';
+          break;
+      }
+      data.updatedAt = firebase.firestore.FieldValue.serverTimestamp();
+      tx.set(docRef, data);
+      // Tra ve BAN SAO khong co updatedAt cho noi goi (applyDelta -> state.data):
+      // gia tri serverTimestamp() con la 1 "sentinel" object noi bo, CHUA phai
+      // Timestamp that (Firestore resolve no o server sau khi ghi) - dua thang
+      // sentinel nay vao state.data se lam hong moi cho dung updatedAt (render,
+      // pregeneratePdf...) sau nay. Cau truc data goc (truoc gio) chua bao gio
+      // co field nay lo ra ngoai UI nen giu nguyen hanh vi do.
+      const { updatedAt, ...dataForCaller } = data;
+      return dataForCaller;
+    });
+    return Object.assign({ success: true }, result);
+  } catch(err){
+    return { success: false, error: err.message };
+  }
 }
 
 /* Gửi 1 action delta (addRow/deleteRow/sign/unlock/reject) trong ĐÚNG 1 lần
