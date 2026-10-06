@@ -272,6 +272,10 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
+/* Cong tac thu nghiem: neu tab Weekly van cham sau khi da sua, doi thanh true de ep Firestore dung
+   long-polling (hay giup khi mang cong ty/proxy chan hoac lam cham ket noi streaming). Mac dinh TAT. */
+const FS_FORCE_LONG_POLLING = false;
+if(FS_FORCE_LONG_POLLING){ db.settings({ experimentalForceLongPolling: true, merge: true }); }
 const OT_COLLECTION = 'ot_data';
 /* ===================== */
 
@@ -584,10 +588,25 @@ async function apiSave(date, data){
 async function apiGetBulk(keys){
   if(!keys.length) return {};
   const out = {};
-  await Promise.all(keys.map(async (k) => {
-    const snap = await db.collection(OT_COLLECTION).doc(k).get();
-    if(snap.exists) out[k] = snap.data();
-  }));
+  // 1 query where(documentId(), 'in', [...]) cho moi nhom 10 key (gioi han an toan cua moi phien ban SDK)
+  // thay vi 1 get() rieng cho tung key -> it round-trip hon nhieu. Tong so doc doc (billing) khong doi.
+  const CHUNK = 10;
+  const chunks = [];
+  for(let i = 0; i < keys.length; i += CHUNK) chunks.push(keys.slice(i, i + CHUNK));
+  try{
+    await Promise.all(chunks.map(async (ch) => {
+      const qs = await db.collection(OT_COLLECTION)
+        .where(firebase.firestore.FieldPath.documentId(), 'in', ch).get();
+      qs.forEach(snap => { out[snap.id] = snap.data(); });
+    }));
+  }catch(e){
+    // Query 'in' loi (vd rules khong cho list) -> quay lai cach cu: doc tung doc song song.
+    console.warn('apiGetBulk: query in loi, doc tung doc', e);
+    await Promise.all(keys.map(async (k) => {
+      const snap = await db.collection(OT_COLLECTION).doc(k).get();
+      if(snap.exists) out[k] = snap.data();
+    }));
+  }
   return out;
 }
 
@@ -628,8 +647,9 @@ function refreshButtonHtml(id, obj, label){
     </div>`;
 }
 
-async function loadData(showSyncDot){
+async function loadData(showSyncDot, force){
   if(NOT_CONFIGURED){ state.loading = false; render(); return; }
+  ensureWatch();
   // Huy request GET truoc do neu no van con dang cho/dang retry (xem giai
   // thich chi tiet o khai bao loadDataAbort ben tren) - nhuong ngay 1 slot
   // ket noi cho request MOI nay thay vi de request cu tiep tuc chiem giu.
@@ -662,7 +682,7 @@ async function loadData(showSyncDot){
     // state.data bang du lieu Staff trong khi man hinh dang o tab Worker ->
     // dung nguyen nhan gay hien tuong "nhap nhay qua lai giua gia tri Staff
     // va Worker" nguoi dung gap phai.
-    if(requestedKey === storageDateKey() && state.pendingMutations === 0){
+    if(requestedKey === storageDateKey() && state.pendingMutations === 0 && (!watchIsLive() || showSyncDot || force)){
       state.data = result && result.rows ? result : { rows: [], approved:false, approvedAt:null, approvedBy:null, rejected:false, rejectedAt:null, rejectedBy:null, rejectComment:'' };
     }
     state.syncError = '';
@@ -692,18 +712,141 @@ async function loadData(showSyncDot){
   if(!shouldSkipRender()) render();
 }
 
+/* TU DONG DOC FIRESTORE THEO CHU KY (poll 2s) DA TAT.
+   Ly do: nhieu nguoi mo trang nhieu gio -> poll 2s tao hang chuc nghin luot doc/gio/tab, ton quota
+   va gay don request khi mang cham. Du lieu bay gio chi duoc doc khi:
+     1) mo trang / doi tab (Staff, Worker, Daily, Weekly, Trend) / doi ngay hoac tuan;
+     2) bam nut Refresh;
+     3) sau moi thao tac ghi cua chinh nguoi dung (Add/Delete/Sign/Unlock/Reject): applyDelta() nhan lai
+        du lieu moi nhat tu transaction nen khong can doc them.
+   Muon bat lai poll tu dong: dat AUTO_POLL_MS = 2000 (ms). 0 = tat. */
+const AUTO_POLL_MS = 0;
 function startPolling(){
-  if(pollTimer) clearInterval(pollTimer);
+  if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+  if(!AUTO_POLL_MS) return;
   pollTimer = setInterval(()=>{
     if(state.category === 'DailySummary') loadDailySummary(false);
     else if(state.category === 'WeeklySummary') loadWeeklySummary(false);
     else if(state.category === 'Trend') { /* no auto-poll: trend data is cached and fetched on demand */ }
     else loadData(false);
-  }, 2000); // Request list refresh interval: 2s so new entries from other users/tabs show up quickly
+  }, AUTO_POLL_MS);
+}
+
+/* ===== TU DONG CAP NHAT KHI NGUOI KHAC NHAP (Firestore listener, khong poll) =====
+   Moi tab dang xem (Staff/Worker: 1 doc; Daily: 3 doc; Weekly: 6 doc) co 1 listener onSnapshot.
+   Firestore chi day du lieu ve khi doc THAY DOI -> mo trang nhieu gio ma khong ai nhap thi khong ton luot doc;
+   moi lan co nguoi nhap/sua/xoa/sign thi may dang xem tu thay ngay. Chi ton: 1 luot doc/doc luc mo + 1 luot
+   doc cho moi lan doc do thay doi. Listener duoc gan/doi tu dong theo tab, ngay, tuan (ensureWatch). */
+let watchUnsub = null, watchSig = '', watchSeq = 0, watchLive = false;
+let watchSkippedPending = false, watchDeferTimer = null, watchRetryAt = 0;
+
+function stableSig(v){
+  if(v === null || v === undefined) return 'null';
+  if(typeof v !== 'object') return JSON.stringify(v);
+  if(typeof v.toMillis === 'function') return 'T' + v.toMillis();
+  if(Array.isArray(v)) return '[' + v.map(stableSig).join(',') + ']';
+  return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + stableSig(v[k])).join(',') + '}';
+}
+function dataSig(d){ const c = Object.assign({}, d || {}); delete c.updatedAt; return stableSig(c); }
+function emptyDayData(){
+  return { rows: [], approved:false, approvedAt:null, approvedBy:null, rejected:false, rejectedAt:null, rejectedBy:null, rejectComment:'' };
+}
+
+function watchKeys(){
+  if(NOT_CONFIGURED) return [];
+  const c = state.category;
+  if(c === 'Staff' || c === 'Worker') return [c + '::' + state.date];
+  if(c === 'DailySummary') return ['Staff::' + state.date, 'Worker::' + state.date, 'DailySummary::' + state.date];
+  if(c === 'WeeklySummary') return weeklyDayList().map(d => 'Staff::' + d);
+  return [];   // Trend: khong theo doi
+}
+function watchIsLive(){ return watchLive && watchSig === watchKeys().join('|'); }
+
+function stopWatch(){
+  if(watchUnsub){ try{ watchUnsub(); }catch(e){} watchUnsub = null; }
+  watchSeq++; watchLive = false; watchSig = '';
+}
+function ensureWatch(){
+  const keys = watchKeys();
+  const sig = keys.join('|');
+  if(sig === watchSig && (watchUnsub || !keys.length)) return;
+  if(!keys.length){ stopWatch(); return; }
+  if(Date.now() < watchRetryAt) return;          // vua loi: cho 30s roi moi thu gan lai
+  stopWatch();
+  watchSig = sig;
+  const seq = ++watchSeq;
+  try{
+    watchUnsub = db.collection(OT_COLLECTION)
+      .where(firebase.firestore.FieldPath.documentId(), 'in', keys)
+      .onSnapshot(
+        qs => onWatchSnapshot(seq, qs),
+        err => {
+          console.warn('watch loi (van dung duoc nut Refresh):', err);
+          if(seq === watchSeq){ watchUnsub = null; watchLive = false; watchRetryAt = Date.now() + 30000; }
+        });
+  }catch(e){ console.warn('watch khong gan duoc', e); watchUnsub = null; }
+}
+
+function onWatchSnapshot(seq, qs){
+  if(seq !== watchSeq) return;                    // snapshot cua listener cu (da doi tab/ngay/tuan)
+  if(qs.metadata && qs.metadata.hasPendingWrites) return;
+  watchLive = true;
+  const bulk = {};
+  qs.forEach(snap => { bulk[snap.id] = snap.data(); });
+  applyWatchBulk(bulk);
+}
+
+function applyWatchBulk(bulk){
+  if(watchKeys().join('|') !== watchSig) return;
+  const c = state.category;
+  let changed = false;
+  if(c === 'Staff' || c === 'Worker'){
+    if(state.pendingMutations > 0){ watchSkippedPending = true; return; }   // dang ghi: de applyDelta/loadData xu ly
+    const res = bulk[c + '::' + state.date];
+    const next = (res && res.rows) ? res : emptyDayData();
+    if(dataSig(next) !== dataSig(state.data)){ state.data = next; changed = true; pregeneratePdf(); }
+    if(state.loading){ state.loading = false; changed = true; }
+    state.syncError = '';
+  } else if(c === 'DailySummary'){
+    const ds = state.dailySummary, d = state.date;
+    const sRes = bulk['Staff::' + d], wRes = bulk['Worker::' + d], mRes = bulk['DailySummary::' + d];
+    const staffRows = (sRes && sRes.rows) ? sRes.rows : [];
+    const workerRows = (wRes && wRes.rows) ? wRes.rows : [];
+    const meta = (mRes && mRes.meta) ? mRes.meta : {};
+    const useMeta = ds.pendingMetaSaves === 0;      // dang luu meta cua minh -> khong ghi de
+    if(stableSig([staffRows, workerRows, useMeta ? meta : ds.meta]) !== stableSig([ds.staffRows, ds.workerRows, ds.meta])){
+      ds.staffRows = staffRows; ds.workerRows = workerRows; if(useMeta) ds.meta = meta; changed = true;
+    }
+    if(ds.loading){ ds.loading = false; changed = true; }
+    ds.syncError = '';
+  } else if(c === 'WeeklySummary'){
+    const ws = state.weeklySummary;
+    const byDate = {};
+    weeklyDayList().forEach(d => { const r = bulk['Staff::' + d]; byDate[d] = (r && r.rows) ? r.rows : []; });
+    if(stableSig(byDate) !== stableSig(ws.staffByDate)){ ws.staffByDate = byDate; changed = true; }
+    if(ws.loading){ ws.loading = false; changed = true; }
+    ws.syncError = '';
+  } else { return; }
+  if(changed){ state.lastSync = new Date(); remoteRender(); }
+}
+
+/* Ve lai do du lieu tu xa: neu nguoi dung dang go/chon o (form, o nhap, lich) hoac dang xac nhan Sign/Unlock/Reject
+   thi HOAN lai (timer chi kiem tra giao dien o may, KHONG doc Firestore) cho den khi ho xong. */
+function remoteRender(){
+  const c = state.category;
+  const busy = (c === 'Staff' || c === 'Worker')
+    ? (isFormFocused() || state.confirmingSign || state.confirmingUnlock || state.confirmingReject)
+    : isFormFocused();
+  if(busy){
+    if(!watchDeferTimer) watchDeferTimer = setTimeout(()=>{ watchDeferTimer = null; remoteRender(); }, 1000);
+    return;
+  }
+  render();
 }
 
 async function loadDailySummary(showSyncDot){
   if(NOT_CONFIGURED){ state.dailySummary.loading = false; render(); return; }
+  ensureWatch();
   const ds = state.dailySummary;
   // shouldSkipRender() duoc GOI LAI ngay truoc moi lan render() (khong dung
   // gia tri tinh san tu dau ham) - vi apiGetBulk() await mat vai tram ms, neu
@@ -717,15 +860,17 @@ async function loadDailySummary(showSyncDot){
     const staffRes = bulk['Staff::' + d];
     const workerRes = bulk['Worker::' + d];
     const metaRes = bulk['DailySummary::' + d];
-    ds.staffRows = (staffRes && staffRes.rows) ? staffRes.rows : [];
-    ds.workerRows = (workerRes && workerRes.rows) ? workerRes.rows : [];
-    // Bo qua ban meta vua fetch neu dang co 1 luot luu Major Fac OT/Max Fac
-    // OT/PIC chua xong (xem pendingMetaSaves trong saveDailySummaryMeta) -
-    // ban fetch nay co the la snapshot CU tu truoc khi luot luu do kip ghi
-    // len server, ghi de no se lam gia tri vua nhap "hien roi mat" tren man
-    // hinh du server da luu dung.
-    if(ds.pendingMetaSaves === 0){
-      ds.meta = (metaRes && metaRes.meta) ? metaRes.meta : {};
+    if(!(watchIsLive() && !showSyncDot)){   // listener da live thi no la nguon su that; Refresh tay van ap dung
+      ds.staffRows = (staffRes && staffRes.rows) ? staffRes.rows : [];
+      ds.workerRows = (workerRes && workerRes.rows) ? workerRes.rows : [];
+      // Bo qua ban meta vua fetch neu dang co 1 luot luu Major Fac OT/Max Fac
+      // OT/PIC chua xong (xem pendingMetaSaves trong saveDailySummaryMeta) -
+      // ban fetch nay co the la snapshot CU tu truoc khi luot luu do kip ghi
+      // len server, ghi de no se lam gia tri vua nhap "hien roi mat" tren man
+      // hinh du server da luu dung.
+      if(ds.pendingMetaSaves === 0){
+        ds.meta = (metaRes && metaRes.meta) ? metaRes.meta : {};
+      }
     }
     ds.syncError = '';
   }catch(e){
@@ -771,22 +916,33 @@ function weeklyDayList(){
 
 async function loadWeeklySummary(showSyncDot){
   if(NOT_CONFIGURED){ state.weeklySummary.loading = false; render(); return; }
+  ensureWatch();
   const ws = state.weeklySummary;
-  // Xem giai thich o loadData()/loadDailySummary() - tinh lai ngay truoc moi
-  // lan render() thay vi dung gia tri "dong bang" tu dau ham.
+  const requestedFrom = ws.from;
+  // Neu cung tuan nay dang tai (poll truoc chua xong, <20s) thi KHONG gui them request moi - tranh don
+  // request chong len nhau khi mang cham. Bam Refresh tay (showSyncDot) luon duoc gui.
+  if(!showSyncDot && ws.inflight && ws.inflight.key === requestedFrom && Date.now() - ws.inflight.t < 20000) return;
+  const myReq = { key: requestedFrom, t: Date.now() };
+  ws.inflight = myReq;
   const shouldSkipRender = ()=> !showSyncDot && isFormFocused();
   if(showSyncDot){ ws.syncing = true; if(!shouldSkipRender()) render(); }
   try{
     const days = weeklyDayList();
     const bulk = await apiGetBulk(days.map(d => 'Staff::' + d));
+    // Nguoi dung da doi sang tuan khac trong luc cho -> bo ket qua cu, de request cua tuan moi tu xu ly.
+    if(ws.from !== requestedFrom){ if(ws.inflight === myReq) ws.inflight = null; return; }
     const byDate = {};
     days.forEach(d => { const res = bulk['Staff::' + d]; byDate[d] = (res && res.rows) ? res.rows : []; });
-    ws.staffByDate = byDate;
+    if(!(watchIsLive() && !showSyncDot)) ws.staffByDate = byDate;
     ws.syncError = '';
+    console.log('[weekly] ' + requestedFrom + ': ' + days.length + ' doc trong ' + (Date.now() - myReq.t) + ' ms');
   }catch(e){
     console.error(e);
+    if(ws.from !== requestedFrom){ if(ws.inflight === myReq) ws.inflight = null; return; }
     ws.syncError = 'Sync failed: ' + e.message;
   }
+  if(ws.inflight === myReq) ws.inflight = null;
+  ws.lastLoadAt = Date.now();
   ws.loading = false;
   ws.syncing = false;
   state.lastSync = new Date();
@@ -1309,6 +1465,7 @@ async function applyDelta(action, payload){
   state.syncing = false;
   state.lastSync = new Date();
   render();
+  if(state.pendingMutations === 0 && watchSkippedPending){ watchSkippedPending = false; loadData(false, true); }
   return ok;
 }
 
@@ -1823,6 +1980,7 @@ function empSuggestListHtml(){
 }
 
 function render(){
+  ensureWatch();
   const app = document.getElementById('app');
   const d = state.data;
   const rows = d.rows || [];
