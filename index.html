@@ -272,6 +272,7 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
+try{ db.enablePersistence({ synchronizeTabs: true }).catch(function(e){ console.warn('Firestore persistence off:', e && e.code); }); }catch(e){}
 /* Cong tac thu nghiem: neu tab Weekly van cham sau khi da sua, doi thanh true de ep Firestore dung
    long-polling (hay giup khi mang cong ty/proxy chan hoac lam cham ket noi streaming). Mac dinh TAT. */
 const FS_FORCE_LONG_POLLING = false;
@@ -690,7 +691,8 @@ async function loadData(showSyncDot, force){
     // so switching tabs/dates also has Export PDF ready ahead of time.
     // Cung phai chan boi cung dieu kien tren, khong thi PDF cache se bi nap
     // nham du lieu cua tab/ngay cu.
-    if(requestedKey === storageDateKey()) pregeneratePdf();
+    // Du lieu da hien ra roi (render o cuoi ham) -> PDF chay NGAM, tre 1.5s, bo qua neu nguoi dung doi ngay tiep
+    if(requestedKey === storageDateKey()) schedulePdfPregen();
   }catch(e){
     // Request nay bi CHINH loadData() lan sau huy (binh thuong, khong phai
     // loi mang that su) - thoat ngay, KHONG dong bat ky co trang thai nao,
@@ -804,7 +806,7 @@ function applyWatchBulk(bulk){
     if(state.pendingMutations > 0){ watchSkippedPending = true; return; }   // dang ghi: de applyDelta/loadData xu ly
     const res = bulk[c + '::' + state.date];
     const next = (res && res.rows) ? res : emptyDayData();
-    if(dataSig(next) !== dataSig(state.data)){ state.data = next; changed = true; pregeneratePdf(); }
+    if(dataSig(next) !== dataSig(state.data)){ state.data = next; changed = true; schedulePdfPregen(); }
     if(state.loading){ state.loading = false; changed = true; }
     state.syncError = '';
   } else if(c === 'DailySummary'){
@@ -1825,6 +1827,8 @@ function pregeneratePdf(){
   pdfGenPromise = (async () => {
     try{
       const built = await buildFilledPdfBytes(true);
+      // Nguoi dung da doi ngay/tab trong luc build -> bo ket qua (co the lech du lieu), build lai cho ngay moi
+      if(currentPdfFingerprint() !== fp){ schedulePdfPregen(); return; }
       state.pdfCache = { key: fp, pdfBytes: built.pdfBytes, fileName: built.fileName, overflow: built.overflow };
       // Cập nhật lại nút Export PDF (Preparing... -> Export PDF) ngay khi bản nền xong,
       // kể cả khi không ai đang bấm gì cả.
@@ -1833,11 +1837,29 @@ function pregeneratePdf(){
       console.error('Background PDF pre-generation failed (Export PDF will fall back to generating on click):', e);
       throw e;
     }finally{
-      pdfGenPromise = null;
-      pdfGenPromiseFp = null;
+      if(pdfGenPromiseFp === fp){ pdfGenPromise = null; pdfGenPromiseFp = null; }
     }
   })();
   return pdfGenPromise;
+}
+
+/* Chay ngam sau khi du lieu da hien: debounce 1.5s (doi ngay lien tuc chi build 1 lan cho ngay cuoi),
+   loi mang/Apps Script (404...) thi tu thu lai toi da 2 lan, cach 5s. Khong chan giao dien. */
+let pdfSchedTimer = null, pdfSchedRetry = 0, pdfSchedFp = '';
+function schedulePdfPregen(){
+  if(pdfSchedTimer) clearTimeout(pdfSchedTimer);
+  pdfSchedTimer = setTimeout(async ()=>{
+    pdfSchedTimer = null;
+    const fp = currentPdfFingerprint();
+    if(fp !== pdfSchedFp){ pdfSchedFp = fp; pdfSchedRetry = 0; }
+    try{ await pregeneratePdf(); pdfSchedRetry = 0; }
+    catch(e){
+      if(pdfSchedRetry < 2 && currentPdfFingerprint() === fp){
+        pdfSchedRetry++;
+        pdfSchedTimer = setTimeout(()=>{ pdfSchedTimer = null; schedulePdfPregen(); }, 5000);
+      }
+    }
+  }, 1500);
 }
 
 async function exportExcel(){
