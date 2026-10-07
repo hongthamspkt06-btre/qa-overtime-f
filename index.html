@@ -10,7 +10,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
 <!-- Firebase (compat build -- global `firebase` object, loads/executes
      synchronously like the libraries above; the app script below runs
-     firebase.initializeApp() immediately, before loadData()/startPolling()
+     firebase.initializeApp() immediately, before loadData()
      fire at the bottom of the file, so no async/module timing issues).
      Served from cdnjs (same domain as xlsx/jsPDF/Chart.js above) instead of
      gstatic.com, which some corporate networks block -- a blocked/hanging
@@ -436,7 +436,9 @@ function storageDateKey(){
   return state.category + '::' + state.date;
 }
 
-let pollTimer = null;
+/* KHONG con polling dinh ky. Firestore chi duoc doc khi: mo trang / F5, chuyen tab,
+   doi ngay hoac tuan, bam Refresh. Sau moi thao tac ghi cua chinh nguoi dung
+   (Add/Delete/Sign/Unlock/Reject/luu meta) du lieu moi nhat lay tu transaction. */
 // Controller cho request GET cua loadData() (tab Staff/Worker) - dung de HUY
 // request TRUOC do neu no van con dang cho/dang retry, moi khi loadData()
 // duoc goi lai (poll 2s tiep theo, hoac nguoi dung doi ngay/tab). Neu khong
@@ -575,6 +577,21 @@ async function apiSave(date, data){
   return Object.assign({ success: true }, data);
 }
 
+/* Doc-sua-ghi meta trong 1 transaction (thay cho apiGet + apiSave rieng le).
+   Tra ve meta moi nhat sau khi ghi nen khong can doc them. mutateFn nhan 1 object
+   meta moi doc tu server o moi lan chay (ke ca khi transaction tu retry). */
+async function apiUpdateMeta(date, mutateFn){
+  const docRef = db.collection(OT_COLLECTION).doc(date);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    const d = snap.exists ? snap.data() : null;
+    const meta = (d && d.meta) ? Object.assign({}, d.meta) : {};
+    mutateFn(meta);
+    tx.set(docRef, { meta: meta, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+    return meta;
+  });
+}
+
 /* Lay nhieu key trong 1 lan (dung cho tab Trend thay vi goi apiGet() rieng
    cho tung ngay). Tra ve map { key: {rows:[...]} }.
    Khac voi Apps Script/Sheet ban dau (phai quet ca cot Key roi moi doc
@@ -692,16 +709,6 @@ async function loadData(showSyncDot){
   if(!shouldSkipRender()) render();
 }
 
-function startPolling(){
-  if(pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(()=>{
-    if(state.category === 'DailySummary') loadDailySummary(false);
-    else if(state.category === 'WeeklySummary') loadWeeklySummary(false);
-    else if(state.category === 'Trend') { /* no auto-poll: trend data is cached and fetched on demand */ }
-    else loadData(false);
-  }, 2000); // Request list refresh interval: 2s so new entries from other users/tabs show up quickly
-}
-
 async function loadDailySummary(showSyncDot){
   if(NOT_CONFIGURED){ state.dailySummary.loading = false; render(); return; }
   const ds = state.dailySummary;
@@ -742,13 +749,7 @@ async function saveDailySummaryMeta(mutateFn){
   const ds = state.dailySummary;
   ds.syncing = true; ds.pendingMetaSaves++; render();
   try{
-    let latestMeta = {};
-    try{
-      const metaRes = await apiGet('DailySummary::' + state.date);
-      latestMeta = (metaRes && metaRes.meta) ? metaRes.meta : {};
-    }catch(e){ console.error(e); }
-    mutateFn(latestMeta);
-    await apiSave('DailySummary::' + state.date, { meta: latestMeta });
+    const latestMeta = await apiUpdateMeta('DailySummary::' + state.date, mutateFn);
     ds.meta = latestMeta;
     ds.syncError = '';
   }catch(e){
@@ -3543,5 +3544,4 @@ document.addEventListener('mousedown', handleDateInputPointer);
 
 render();
 loadData(false);
-startPolling();
 </script>
