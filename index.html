@@ -381,7 +381,7 @@ let state = {
   // Cache of the last background-generated PDF (see pregeneratePdf()), keyed
   // by a fingerprint of the data it was built from, so Export PDF can serve
   // it instantly instead of rebuilding on click.
-  pdfCache: { key: null, pdfBytes: null, fileName: null, overflow: 0 },
+  // (PDF cache nay da chuyen sang pdfCacheMap - nhieu ngay/tab, xem khoi PDF ben duoi)
   empSuggestOpen: false,
   // Counts in-flight add/delete/sign/unlock/reject requests (see applyDelta
   // below). While >0, loadData()'s background poll must not overwrite
@@ -645,6 +645,56 @@ function refreshButtonHtml(id, obj, label){
     </div>`;
 }
 
+/* ====== Cache du lieu theo ngay (Staff/Worker) ======
+   Muc tieu: chon lai mot ngay da xem (hoac da duoc prefetch) thi hien LIEN,
+   sau do loadData() van doc lai Firestore ngam de cap nhat neu co thay doi
+   (stale-while-revalidate). Luu ban sao (clone) de sua optimistic tren
+   state.data khong lam ban cache. */
+const dayDataCache = new Map();
+const DAY_CACHE_MAX = 80;
+const PREFETCH_DAYS = 14; // so ngay gan day duoc nap san (Staff+Worker). Dat 0 de tat.
+function emptyDayData(){
+  return { rows: [], approved:false, approvedAt:null, approvedBy:null, rejected:false, rejectedAt:null, rejectedBy:null, rejectComment:'' };
+}
+function cloneDay(o){ return JSON.parse(JSON.stringify(o)); }
+function cacheDayData(key, data){
+  dayDataCache.delete(key);
+  dayDataCache.set(key, cloneDay(data));
+  while(dayDataCache.size > DAY_CACHE_MAX){
+    dayDataCache.delete(dayDataCache.keys().next().value);
+  }
+}
+/* Neu ngay/tab hien tai da co trong cache: gan vao state.data, tat loading
+   va tra ve true (noi goi tu render()). Cung kich hoat tao PDF ngam. */
+function showCachedDay(){
+  const c = dayDataCache.get(storageDateKey());
+  if(!c || state.pendingMutations !== 0) return false;
+  state.data = cloneDay(c);
+  state.loading = false;
+  state.syncError = '';
+  pregeneratePdf();
+  return true;
+}
+/* Nap san du lieu cac ngay gan day (1 lan, sau khi trang da len) de chon ngay cu la hien ngay. */
+function prefetchRecentDays(){
+  if(NOT_CONFIGURED || !PREFETCH_DAYS) return;
+  setTimeout(async ()=>{
+    try{
+      const keys = [];
+      for(let i = 1; i <= PREFETCH_DAYS; i++){
+        const d = addDaysStr(todayStr(), -i);
+        ['Staff','Worker'].forEach(c => { const k = c + '::' + d; if(!dayDataCache.has(k)) keys.push(k); });
+      }
+      if(!keys.length) return;
+      const bulk = await apiGetBulk(keys);
+      keys.forEach(k => {
+        if(dayDataCache.has(k)) return; // loadData() da nap ban moi hon
+        cacheDayData(k, (bulk[k] && bulk[k].rows) ? bulk[k] : emptyDayData());
+      });
+    }catch(e){ console.warn('Prefetch recent days failed (ignored):', e); }
+  }, 2500);
+}
+
 async function loadData(showSyncDot){
   if(NOT_CONFIGURED){ state.loading = false; render(); return; }
   // Huy request GET truoc do neu no van con dang cho/dang retry (xem giai
@@ -679,8 +729,10 @@ async function loadData(showSyncDot){
     // state.data bang du lieu Staff trong khi man hinh dang o tab Worker ->
     // dung nguyen nhan gay hien tuong "nhap nhay qua lai giua gia tri Staff
     // va Worker" nguoi dung gap phai.
+    const normResult = (result && result.rows) ? result : emptyDayData();
+    cacheDayData(requestedKey, normResult); // ket qua server luon dung cho dung key nay, du user da doi tab/ngay
     if(requestedKey === storageDateKey() && state.pendingMutations === 0){
-      state.data = result && result.rows ? result : { rows: [], approved:false, approvedAt:null, approvedBy:null, rejected:false, rejectedAt:null, rejectedBy:null, rejectComment:'' };
+      state.data = normResult;
     }
     state.syncError = '';
     // Warm the PDF cache for this date/category too (not just after edits),
@@ -1294,6 +1346,7 @@ async function applyDelta(action, payload){
       const newData = Object.assign({}, result);
       delete newData.success;
       state.data = newData;
+      cacheDayData(requestedKey, newData);
       // Background trigger: every time data actually changes (add/delete row,
       // sign/unlock/reject), silently re-fill the template, recalc formulas and
       // convert to PDF now, so the PDF is already sitting in cache and Export
@@ -1500,22 +1553,54 @@ function addFreezeHeaderRows(xml, splitRow){
   return xml.replace(withChildren[0], `<sheetView${withChildren[1]}>${paneTag}${withChildren[2]}</sheetView>`);
 }
 
-/* Chuỗi định danh (fingerprint) mọi thứ ảnh hưởng tới nội dung PDF của
-   ngày/category hiện tại, để cache biết khi nào "còn mới" và khi nào "cũ". */
-function currentPdfFingerprint(){
-  const rows = state.data.rows || [];
-  const lastTs = rows.length ? rows[rows.length-1].ts : '';
-  return [state.category, state.date, rows.length, lastTs, state.data.approved?'A':'', state.data.rejected?'R':''].join('|');
+/* ====== PDF ngam: snapshot + hang doi + cache nhieu ngay ======
+   - Snapshot: buildFilledPdfBytes() chi doc tu snapshot (category/date/data
+     chup luc len lich), KHONG doc state.* trong luc await -> doi ngay giua
+     chung khong lam PDF bi tron du lieu.
+   - Hang doi 1 luong: chi 1 request len Apps Script moi luc; job nen cu chua
+     chay bi bo khi co job nen moi (lướt nhieu ngay khong dồn request).
+   - Cache nhieu PDF (LRU) theo fingerprint: quay lai ngay da tao thi xuat ngay.
+   - Debounce 700ms: chi tao PDF cho ngay nguoi dung DUNG lai. */
+const PDF_CACHE_MAX = 12;
+const pdfCacheMap = new Map();      // fingerprint -> { pdfBytes, fileName, overflow }
+const pdfJobs = new Map();          // fingerprint -> job dang cho/dang chay
+let pdfPending = [];
+let pdfRunning = false;
+let pdfDebounceTimer = null;
+const pdfYield = () => new Promise(r => setTimeout(r, 0));
+
+function takePdfSnapshot(){
+  const d = state.data || {};
+  return {
+    category: state.category,
+    date: state.date,
+    data: Object.assign({}, d, { rows: (d.rows || []).map(r => Object.assign({}, r)) })
+  };
+}
+/* Fingerprint: moi thu anh huong noi dung PDF (gom noi dung tung dong, khong chi so dong). */
+function snapshotFingerprint(snap){
+  const rows = snap.data.rows || [];
+  const str = rows.map(r => [r.idCode, r.otFrom, r.otTo, r.ownTeam, r.remark, r.ts].join('~')).join('|');
+  let h = 5381;
+  for(let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+  return [snap.category, snap.date, rows.length, h,
+          snap.data.approved ? ('A' + (snap.data.approvedAt || '')) : '',
+          snap.data.rejected ? 'R' : ''].join('|');
+}
+function currentPdfFingerprint(){ return snapshotFingerprint(takePdfSnapshot()); }
+
+function pdfCacheSet(fp, built){
+  pdfCacheMap.delete(fp);
+  pdfCacheMap.set(fp, built);
+  while(pdfCacheMap.size > PDF_CACHE_MAX) pdfCacheMap.delete(pdfCacheMap.keys().next().value);
 }
 
-/* Điền template, tính công thức và gọi Apps Script chuyển thành PDF; trả về
-   bytes chứ KHÔNG tự tải xuống. Dùng chung cho cả nút Export PDF (foreground)
-   lẫn trigger nền pregeneratePdf() (silent) để chỉ có một chỗ chứa logic này. */
-async function buildFilledPdfBytes(silent){
-  const rows = (state.data.rows || []).slice(0, TEMPLATE_MAX_ROWS);
-  const overflow = (state.data.rows || []).length - rows.length;
+async function buildFilledPdfBytes(snap){
+  const rows = (snap.data.rows || []).slice(0, TEMPLATE_MAX_ROWS);
+  const overflow = (snap.data.rows || []).length - rows.length;
 
   const zip = await JSZip.loadAsync(b64ToUint8(TEMPLATE_B64));
+  await pdfYield();
   let sheetXml = await zip.file('xl/worksheets/sheet1.xml').async('string');
 
   // Widen column B (Emp/ID Code) so codes like "USV000026" are not clipped
@@ -1533,7 +1618,7 @@ async function buildFilledPdfBytes(silent){
   sheetXml = addFreezeHeaderRows(sheetXml, 10);
 
   // Date (J8)
-  sheetXml = setNumberCell(sheetXml, 'J8', excelDateSerial(state.date));
+  sheetXml = setNumberCell(sheetXml, 'J8', excelDateSerial(snap.date));
   const styleIdE = getStyleId(sheetXml, 'E11');
   const styleIdF = getStyleId(sheetXml, 'F11');
 
@@ -1554,7 +1639,7 @@ async function buildFilledPdfBytes(silent){
 
   // Worker tab: remove the Recheck (column G) formula entirely across all
   // template rows. Staff tab keeps the original formula untouched.
-  if(state.category === 'Worker'){
+  if(snap.category === 'Worker'){
     for(let rn = 11; rn <= 70; rn++){
       const reG = new RegExp('<c r="G' + rn + '"([^>]*)>.*?</c>');
       sheetXml = sheetXml.replace(reG, (m, attrs) => `<c r="G${rn}"${attrs}/>`);
@@ -1562,8 +1647,8 @@ async function buildFilledPdfBytes(silent){
   }
 
   // Signed caption text in I84 (cell value, separate from the floating signature image)
-  if(state.data.approved){
-    const signedText = 'Signed ' + fmtDateTime(state.data.approvedAt);
+  if(snap.data.approved){
+    const signedText = 'Signed ' + fmtDateTime(snap.data.approvedAt);
     sheetXml = setInlineStrCell(sheetXml, 'I84', signedText);
   }
 
@@ -1589,7 +1674,7 @@ async function buildFilledPdfBytes(silent){
 
   // Signature image, only if signed off - placed just above I84 (row 83) so the
   // "Signed ..." text in I84 stays visible underneath/beside it
-  if(state.data.approved){
+  if(snap.data.approved){
     const sigBytes = b64ToUint8(SIG_IMG.split(',')[1]);
     zip.file('xl/media/image2.png', sigBytes);
 
@@ -1615,18 +1700,14 @@ async function buildFilledPdfBytes(silent){
   // Build the filled xlsx in-memory (not downloaded directly) then send it to
   // the Apps Script backend, which uploads it to Google Sheets (so formulas
   // are actually calculated) and converts it to a locked, non-editable PDF.
-  if(!silent){
-    state.exportMsg = 'Filling template, calculating formulas and generating PDF (may take a few seconds)...';
-    render();
-  }
-
+  await pdfYield();
   const outBase64 = await zip.generateAsync({ type: 'base64' });
 
   const pdfRes = await fetch(APPS_SCRIPT_URL, {
     method: 'POST',
     body: JSON.stringify({
       action: 'exportPdf',
-      fileName: 'Overtime_Form_' + state.category + '_' + state.date + '.xlsx',
+      fileName: 'Overtime_Form_' + snap.category + '_' + snap.date + '.xlsx',
       fileBase64: outBase64
     })
   });
@@ -1636,74 +1717,93 @@ async function buildFilledPdfBytes(silent){
 
   return {
     pdfBytes: b64ToUint8(pdfResult.pdfBase64),
-    fileName: 'Overtime_Form_' + state.category + '_' + state.date + '.pdf',
+    fileName: 'Overtime_Form_' + snap.category + '_' + snap.date + '.pdf',
     overflow
   };
 }
 
-/* Dedup: nhiều nơi có thể trigger pregeneratePdf() gần như cùng lúc (poll
-   2s, mutation vừa xong, chuyển tab...). Nếu không dedup, mỗi lần gọi lại
-   bắn 1 request build+convert+export PDF RIÊNG lên Apps Script dù cùng
-   fingerprint — vừa phí, vừa khiến các request xếp hàng chờ nhau (Apps
-   Script giới hạn số lượt thực thi đồng thời), kéo dài thời gian chờ thật
-   sự. pdfGenPromise giữ Promise của lượt build đang chạy dở, cho các lệnh
-   gọi sau (kể cả nút Export PDF bấm tay) JOIN vào thay vì bắn thêm request. */
-let pdfGenPromise = null;
-let pdfGenPromiseFp = null;
 
-/* Trigger nền: chạy tự động ngay sau mỗi lần dữ liệu thay đổi (thêm/xóa
-   dòng, sign/unlock/reject) - đọc lại, điền sẵn template, tính công thức và
-   tạo PDF NGAY, lưu vào cache. Cùng cách làm với Line QA / QA Manpower
-   dashboard: tính trước ở nền, để khi bấm "Export PDF" là có sẵn, xuất liền,
-   không phải đợi vài giây. Trả về Promise để exportExcel() có thể JOIN vào
-   thay vì tự bắn thêm 1 request build riêng khi người dùng bấm nút ngay
-   lúc bản nền còn đang chạy dở. */
-function pregeneratePdf(){
-  if(NOT_CONFIGURED) return Promise.resolve();
-  if(state.category !== 'Staff' && state.category !== 'Worker') return Promise.resolve();
-  const fp = currentPdfFingerprint();
-  if(state.pdfCache.key === fp) return Promise.resolve(); // đã có bản mới nhất trong cache rồi
-  if(pdfGenPromise && pdfGenPromiseFp === fp) return pdfGenPromise; // đang có 1 lượt build y hệt chạy dở -> join vào, không bắn thêm
-
-  pdfGenPromiseFp = fp;
-  pdfGenPromise = (async () => {
-    try{
-      const built = await buildFilledPdfBytes(true);
-      state.pdfCache = { key: fp, pdfBytes: built.pdfBytes, fileName: built.fileName, overflow: built.overflow };
-      // Cập nhật lại nút Export PDF (Preparing... -> Export PDF) ngay khi bản nền xong,
-      // kể cả khi không ai đang bấm gì cả.
-      render();
-    }catch(e){
-      console.error('Background PDF pre-generation failed (Export PDF will fall back to generating on click):', e);
-      throw e;
-    }finally{
-      pdfGenPromise = null;
-      pdfGenPromiseFp = null;
+async function pdfPump(){
+  if(pdfRunning) return;
+  pdfRunning = true;
+  try{
+    while(pdfPending.length){
+      const job = pdfPending.shift();
+      try{
+        await pdfYield(); // nhuong UI truoc khi lam viec nang
+        const built = await buildFilledPdfBytes(job.snap);
+        pdfCacheSet(job.fp, built);
+        job.resolve(built);
+      }catch(e){
+        console.error('PDF generation failed:', e);
+        job.reject(e);
+      }finally{
+        pdfJobs.delete(job.fp);
+      }
     }
-  })();
-  return pdfGenPromise;
+  }finally{
+    pdfRunning = false;
+  }
+}
+
+/* Dua 1 snapshot vao hang doi. urgent=true (nguoi dung vua bam Export): chen len dau, khong bi bo. */
+function pdfEnqueue(snap, urgent){
+  const fp = snapshotFingerprint(snap);
+  if(pdfCacheMap.has(fp)) return Promise.resolve(pdfCacheMap.get(fp));
+  const existing = pdfJobs.get(fp);
+  if(existing){
+    if(urgent && !existing.urgent){
+      existing.urgent = true;
+      const i = pdfPending.indexOf(existing);
+      if(i > 0){ pdfPending.splice(i, 1); pdfPending.unshift(existing); }
+    }
+    return existing.promise; // JOIN vao job y het dang cho/dang chay
+  }
+  const job = { fp, snap, urgent: !!urgent };
+  job.promise = new Promise((res, rej) => { job.resolve = res; job.reject = rej; });
+  job.promise.catch(() => {}); // job nen that bai khong gay "unhandled rejection"; export van nhan loi qua await
+  if(urgent){
+    pdfPending.unshift(job);
+  } else {
+    // chi giu 1 job nen dang cho (moi nhat); bo cac job nen cu chua chay
+    pdfPending = pdfPending.filter(j => {
+      if(j.urgent) return true;
+      pdfJobs.delete(j.fp);
+      j.resolve(null);
+      return false;
+    });
+    pdfPending.push(job);
+  }
+  pdfJobs.set(fp, job);
+  pdfPump();
+  return job.promise;
+}
+
+/* Trigger nen (debounce): goi sau khi du lieu ngay hien tai da san sang. */
+function pregeneratePdf(){
+  if(NOT_CONFIGURED) return;
+  if(state.category !== 'Staff' && state.category !== 'Worker') return;
+  clearTimeout(pdfDebounceTimer);
+  pdfDebounceTimer = setTimeout(() => {
+    if(state.category !== 'Staff' && state.category !== 'Worker') return;
+    if(state.loading) return; // state.data chua phai cua ngay nay; loadData() xong se goi lai
+    pdfEnqueue(takePdfSnapshot(), false);
+  }, 700);
 }
 
 async function exportExcel(){
   state.exporting = true; state.exportMsg = ''; render();
   try{
-    const fp = currentPdfFingerprint();
-    let built;
-    if(state.pdfCache.key === fp && state.pdfCache.pdfBytes){
-      // Đường tắt: PDF đã được điền sẵn, tính công thức và convert ở nền
-      // ngay sau lần thay đổi dữ liệu gần nhất -> xuất liền, không phải chờ.
-      built = state.pdfCache;
-    } else {
-      // Chưa có sẵn trong cache — thay vì tự bắn thêm 1 request build RIÊNG
-      // (trùng việc với bản nền có thể đang chạy dở, xếp hàng làm chậm cả
-      // 2), JOIN vào đúng 1 pipeline pregeneratePdf() dùng chung cho mọi nơi.
-      state.exportMsg = 'Preparing PDF in the background — this only happens right after new data, subsequent exports are instant...';
+    if(state.loading) throw new Error('Data is still loading — please try again in a moment');
+    const snap = takePdfSnapshot();
+    const fp = snapshotFingerprint(snap);
+    let built = pdfCacheMap.get(fp);
+    if(!built){
+      // Chua co san: dua len dau hang doi (JOIN neu job y het dang chay) va cho.
+      state.exportMsg = 'Preparing PDF — this only happens right after opening a new date, later exports of the same date are instant...';
       render();
-      await pregeneratePdf();
-      built = state.pdfCache;
-      if(!built || !built.pdfBytes || state.pdfCache.key !== fp){
-        throw new Error('PDF preparation did not complete — please try again');
-      }
+      built = await pdfEnqueue(snap, true);
+      if(!built || !built.pdfBytes) throw new Error('PDF preparation did not complete — please try again');
     }
 
     const pdfBlob = new Blob([built.pdfBytes], { type: 'application/pdf' });
@@ -1717,7 +1817,7 @@ async function exportExcel(){
     setTimeout(()=>URL.revokeObjectURL(url), 4000);
 
     state.exportMsg = built.overflow > 0
-      ? `Exported as PDF. Note: this date has ${state.data.rows.length} entries but the template only fits ${TEMPLATE_MAX_ROWS} rows — the last ${built.overflow} were not included.`
+      ? `Exported as PDF. Note: this date has ${snap.data.rows.length} entries but the template only fits ${TEMPLATE_MAX_ROWS} rows — the last ${built.overflow} were not included.`
       : 'Exported successfully as a non-editable PDF in the official company format.';
   }catch(e){
     console.error(e);
@@ -2092,6 +2192,7 @@ function render(){
       }
     } else {
       state.loading = true;
+      if(showCachedDay()) render();
       loadData(false);
     }
   }
@@ -2107,7 +2208,7 @@ function render(){
   if(tabTrend) tabTrend.onclick = ()=>switchTab('Trend');
 
   const dp = document.getElementById('datePicker');
-  if(dp) dp.onchange = (e)=>{ dateInputActive = false; state.date = e.target.value; state.loading = true; state.confirmingSign=false; state.confirmingUnlock=false; state.confirmingReject=false; state.showSignOffActions=false; state.exportMsg=''; loadData(false); };
+  if(dp) dp.onchange = (e)=>{ dateInputActive = false; state.date = e.target.value; state.loading = true; state.confirmingSign=false; state.confirmingUnlock=false; state.confirmingReject=false; state.showSignOffActions=false; state.exportMsg=''; const _hit = showCachedDay(); if(_hit){ if(isDateInputEl(document.activeElement)) document.activeElement.blur(); render(); } loadData(false); };
 
   const rb = document.getElementById('refreshBtn');
   if(rb) rb.onclick = ()=>runManualRefresh(state, ()=>loadData(true));
@@ -2301,6 +2402,7 @@ function renderDailySummary(app){
       }
     } else {
       state.loading = true;
+      if(showCachedDay()) render();
       loadData(false);
     }
   }
@@ -2649,6 +2751,7 @@ function renderWeeklySummary(app){
       }
     } else {
       state.loading = true;
+      if(showCachedDay()) render();
       loadData(false);
     }
   }
@@ -3544,4 +3647,5 @@ document.addEventListener('mousedown', handleDateInputPointer);
 
 render();
 loadData(false);
+prefetchRecentDays();
 </script>
